@@ -62,7 +62,7 @@ echo "✓ Supported OS detected: ${PRETTY_NAME:-$OS_ID}"
 # Check minimum available disk space
 # ------------------------------------------------------------
 
-REQUIRED_DISK_GB=6
+REQUIRED_DISK_GB=8
 
 echo "Checking for sufficient disk space..."
 
@@ -142,12 +142,14 @@ fi
 
 # Required packages
 PACKAGES=(
+    acl
     android-sdk-platform-tools-common
     build-essential
     ca-certificates
     curl
     git
     gpg
+    mesa-utils
     unzip
     zip
 )
@@ -184,6 +186,42 @@ if (( VIM_WAS_INSTALLED )); then
     echo "✓ APT cleanup complete"
 fi
 
+# Grant GPU device access (/dev/dri) to sessions without a logind seat, such as ChromeOS Linux
+if [[ "$TARGET_USER" != "root" ]]; then
+    GPU_GROUPS=()
+    for group in render video; do
+        getent group "$group" >/dev/null 2>&1 && GPU_GROUPS+=("$group")
+    done
+
+    GPU_GROUPS_ADDED=0
+    for group in "${GPU_GROUPS[@]}"; do
+        if [[ " $(id -nG "$TARGET_USER") " != *" $group "* ]]; then
+            usermod -a -G "$group" "$TARGET_USER"
+            GPU_GROUPS_ADDED=1
+        fi
+    done
+
+    # The groups only apply to new login sessions; ACLs grant the current session
+    # access right away (they last until the /dev/dri nodes are recreated).
+    for gpu_node in /dev/dri/card* /dev/dri/renderD*; do
+        [[ -c "$gpu_node" ]] || continue
+        setfacl -m "u:$TARGET_USER:rw" "$gpu_node" 2>/dev/null || true
+    done
+
+    # Verify GPU group membership
+    for group in "${GPU_GROUPS[@]}"; do
+        [[ " $(id -nG "$TARGET_USER") " == *" $group "* ]] ||
+            error "User '$TARGET_USER' is not in the '$group' group."
+    done
+
+    if (( ${#GPU_GROUPS[@]} > 0 )); then
+        echo "✓ GPU groups: ${GPU_GROUPS[*]}"
+    fi
+    if (( GPU_GROUPS_ADDED )); then
+        echo "  Added to new groups; the current session has GPU access via ACLs, and the groups apply after logging out, or fully shutting down the Linux VM."
+    fi
+fi
+
 # ------------------------------------------------------------
 # Install OpenJDK
 # ------------------------------------------------------------
@@ -217,7 +255,7 @@ esac
 
 JAVA_URL="$(
     curl -fsSL "https://jdk.java.net/${JAVA_VERSION}/" 2>/dev/null |
-        grep -o "https://download.java.net/java/GA/jdk${JAVA_VERSION}/[^\"]*linux-${JAVA_ARCH}_bin\.tar\.gz" |
+        grep -oE "https://download\.java\.net/java/GA/jdk${JAVA_VERSION}(\.[0-9]+)*/[^\"]*linux-${JAVA_ARCH}_bin\.tar\.gz" |
         head -n 1 || true
 )"
 
@@ -508,11 +546,39 @@ if [[ -d "$ANDROID_HOME/build-tools" ]]; then
     )
 fi
 
+# Install or update Android Emulator.
+# No system images or virtual devices are installed here; `android emulator create <profile>`
+# downloads the system image it needs when a device is first created.
+INSTALLED_EMULATOR_VERSION="$(
+    run_as_target env \
+        ANDROID_HOME="$ANDROID_HOME" \
+        "$ANDROID_CLI" sdk list 'emulator' 2>/dev/null |
+        awk '/^[[:space:]]*emulator[[:space:]]+/ {print $2; exit}' || true
+)"
+
+LATEST_EMULATOR_VERSION="$(
+    run_as_target env \
+        ANDROID_HOME="$ANDROID_HOME" \
+        "$ANDROID_CLI" sdk list --all 'emulator' 2>/dev/null |
+        awk '/^[[:space:]]*emulator[[:space:]]+/ {ver=$2} END {print ver}' || true
+)"
+
+if [[ -n "$INSTALLED_EMULATOR_VERSION" && -n "$LATEST_EMULATOR_VERSION" && "$INSTALLED_EMULATOR_VERSION" == "$LATEST_EMULATOR_VERSION" && -x "$ANDROID_HOME/emulator/emulator" ]]; then
+    echo "✓ Android Emulator ($INSTALLED_EMULATOR_VERSION) already installed. Skipping."
+else
+    echo "Installing or updating Android Emulator..."
+
+    run_as_target env \
+        ANDROID_HOME="$ANDROID_HOME" \
+        "$ANDROID_CLI" sdk install emulator
+fi
+
 chown -R "$TARGET_USER:$TARGET_GROUP" "$ANDROID_HOME"
 
 echo "✓ Android SDK platform-tools installed"
 echo "✓ Android SDK platform $ANDROID_PLATFORM_VERSION installed"
 echo "✓ Android SDK build-tools $ANDROID_BUILD_TOOLS_VERSION installed"
+echo "✓ Android Emulator installed"
 
 # Configure Android SDK environment and platform-tools PATH
 run_as_target bash -c '
@@ -545,9 +611,55 @@ test -x "$ANDROID_HOME/platform-tools/adb" ||
 test -x "$ANDROID_HOME/platform-tools/fastboot" ||
     error "fastboot installation verification failed."
 
+# Verify Android Emulator
+test -x "$ANDROID_HOME/emulator/emulator" ||
+    error "Android Emulator installation verification failed."
+
+run_as_target "$ANDROID_HOME/emulator/emulator" -version >/dev/null 2>&1 ||
+    error "Android Emulator execution verification failed."
+
 echo "✓ Android CLI verified"
 echo "✓ ADB verified"
 echo "✓ fastboot verified"
+echo "✓ Android Emulator verified"
+
+# ------------------------------------------------------------
+# Configure KVM access for the Android emulator
+# ------------------------------------------------------------
+
+# KVM is used only by the Android emulator in this environment. Without it the
+# emulator falls back to slow software emulation and nothing else is affected,
+# so any KVM problem is a warning, not an error.
+KVM_STATUS="unavailable"
+if [[ "$(uname -m)" == "x86_64" ]] && ! grep -qE -m1 '(vmx|svm)' /proc/cpuinfo; then
+    echo "⚠ KVM: hardware virtualization (VT-x/AMD-V) is not available; the Android emulator will run without acceleration"
+elif [[ ! -c /dev/kvm ]]; then
+    echo "⚠ KVM: /dev/kvm is missing; the Android emulator will run without acceleration"
+else
+    KVM_GROUP_ADDED=0
+    if [[ "$TARGET_USER" != "root" ]]; then
+        if getent group kvm >/dev/null 2>&1 &&
+            [[ " $(id -nG "$TARGET_USER") " != *" kvm "* ]]; then
+            usermod -a -G kvm "$TARGET_USER"
+            KVM_GROUP_ADDED=1
+        fi
+
+        # The kvm group only applies to new login sessions; an ACL grants the
+        # current session access right away (it lasts until /dev/kvm is recreated).
+        setfacl -m "u:$TARGET_USER:rw" /dev/kvm 2>/dev/null || true
+    fi
+
+    # Verify KVM access by opening /dev/kvm read/write as the target user
+    if run_as_target bash -c 'exec 3<>/dev/kvm' 2>/dev/null; then
+        KVM_STATUS="accessible"
+        echo "✓ KVM: /dev/kvm accessible for the Android emulator"
+        if (( KVM_GROUP_ADDED )); then
+            echo "  Added to the 'kvm' group; it applies to new sessions after logging out, or fully shutting down the Linux VM."
+        fi
+    else
+        echo "⚠ KVM: $TARGET_USER cannot open /dev/kvm; the Android emulator will run without acceleration"
+    fi
+fi
 
 # ------------------------------------------------------------
 # Install Antigravity CLI
@@ -961,6 +1073,32 @@ else
 fi
 
 echo
+echo "KVM (Android emulator acceleration):"
+if [[ "$KVM_STATUS" == "accessible" ]] &&
+    run_as_target "$ANDROID_HOME/emulator/emulator" -accel-check >/dev/null 2>&1; then
+    echo "✓ KVM verified (Android emulator -accel-check passed)"
+elif [[ "$KVM_STATUS" == "accessible" ]]; then
+    echo "⚠ /dev/kvm is accessible but Android emulator -accel-check failed; run '$ANDROID_HOME/emulator/emulator -accel-check' for details"
+else
+    echo "⚠ KVM unavailable; the Android emulator will run without acceleration"
+fi
+
+echo
+echo "GPU acceleration:"
+# Query OpenGL headlessly as the target user, so the result reflects their render/video group access
+GPU_INFO="$(run_as_target env -u DISPLAY -u WAYLAND_DISPLAY eglinfo -B -p surfaceless 2>/dev/null)" || true
+GPU_RENDERER="$(awk -F': ' '/OpenGL (core profile |ES profile )?renderer/ { print $2; exit }' <<< "$GPU_INFO")"
+if [[ -z "$GPU_RENDERER" ]]; then
+    echo "⚠ GPU renderer could not be queried; the Android emulator may fall back to software rendering"
+elif [[ "$GPU_RENDERER" =~ llvmpipe|softpipe|swrast ]]; then
+    echo "$GPU_RENDERER"
+    echo "⚠ GPU acceleration unavailable (software rendering); check that $TARGET_USER is in the render/video groups (log out or restart Linux after adding), and on ChromeOS enable chrome://flags/#crostini-gpu-support and fully restart Linux"
+else
+    echo "$GPU_RENDERER"
+    echo "✓ GPU acceleration verified"
+fi
+
+echo
 echo "Android SDK:"
 
 test -d "$ANDROID_HOME" ||
@@ -977,6 +1115,9 @@ test -d "$ANDROID_HOME/platforms/$ANDROID_PLATFORM_VERSION" ||
 
 test -x "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt" ||
     error "Android SDK build-tools $ANDROID_BUILD_TOOLS_VERSION not found."
+
+test -x "$ANDROID_HOME/emulator/emulator" ||
+    error "Android Emulator not found."
 
 test -x "$ANDROID_CLI" ||
     error "Android CLI binary not found."
@@ -996,12 +1137,18 @@ fastboot_version="$(
         "'$ANDROID_HOME/platform-tools/fastboot' --version"
 )"
 
+emulator_version="$(
+    run_as_target "$ANDROID_HOME/emulator/emulator" -version 2>/dev/null
+)"
+
 echo "Android CLI: $android_version"
 echo "$adb_version"
 echo "$fastboot_version"
+echo "${emulator_version%%$'\n'*}"
 
 echo "✓ Android CLI verified"
 echo "✓ Android platform-tools verified"
+echo "✓ Android Emulator verified"
 echo "✓ ADB verified"
 echo "✓ fastboot verified"
 echo "✓ Android SDK platform $ANDROID_PLATFORM_VERSION verified"

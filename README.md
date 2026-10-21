@@ -25,9 +25,9 @@ chmod +x setup.sh
 
 | Component | Description | Installation Source |
 |---|---|---|
-| **Android SDK & CLI** | Android CLI, Platform-Tools (`adb`, `fastboot`), Build-Tools (`aapt`), Latest Platform | Google Android CLI installer |
+| **Android SDK & CLI** | Android CLI, Platform-Tools (`adb`, `fastboot`), Build-Tools (`aapt`), Latest Platform, Android Emulator (no system images or virtual devices; `android emulator create <profile>` downloads the image it needs) | Google Android CLI installer |
 | **Antigravity CLI** | Google Antigravity CLI (`agy`) | Official Google installer |
-| **Base Build & System Tools** | `android-sdk-platform-tools-common` (udev device rules for non-root `adb`/`fastboot`), `build-essential`, `ca-certificates`, `curl`, `gpg`, `unzip`, `zip` | APT repository |
+| **Base Build & System Tools** | `acl` (`setfacl`, for immediate `/dev/kvm` and `/dev/dri` access), `android-sdk-platform-tools-common` (udev device rules for non-root `adb`/`fastboot`), `build-essential`, `ca-certificates`, `curl`, `gpg`, `mesa-utils` (`eglinfo`, to check GPU acceleration), `unzip`, `zip` | APT repository |
 | **Claude Code** | Anthropic's agentic coding CLI (`claude`) | Official Anthropic installer |
 | **Firefox web-ext** | Mozilla WebExtension CLI | Global npm package |
 | **Git** | Distributed version control system | APT repository |
@@ -48,6 +48,8 @@ chmod +x setup.sh
   - Loads environment configurations dynamically across login and interactive shells (`~/.profile`, `~/.bashrc`, and `~/.zshenv` for Zsh users) guarded by idempotent delimiters and reload guards.
   - Prioritizes security and privilege separation: system-wide toolchains (`go`, `gofmt`, `java`, `javac`) are linked into `/usr/local/bin`, while user-space binaries (`android`, `adb`, `fastboot`, `agy`, `claude`) remain securely scoped to the user's home and PATH without exposing user-owned binaries to root.
 - **System Cleanup**: Removes `vim` if installed, then runs `apt-get autoremove -y` to clear its leftover dependencies (e.g. `vim-runtime`, `libsodium23`). Note that `autoremove` also removes any other packages APT considers no longer needed.
+- **GPU Device Access**: Adds the target user to the `render` and `video` groups (when they exist) so GPU-accelerated tools can open `/dev/dri` in sessions without a logind seat, such as ChromeOS Linux, SSH or CI. The current session gets access right away via ACLs; new groups take effect after logging out or fully shutting down the Linux VM.
+- **KVM for the Android Emulator**: When hardware virtualization and `/dev/kvm` are available (including nested KVM on ChromeOS Linux), adds the target user to the `kvm` group, grants the current session access via an ACL, and verifies that `/dev/kvm` opens read/write. KVM is used only for Android emulator acceleration, so when it is missing or cannot be opened (e.g. VMs or platforms without nested virtualization) setup continues with a warning and the emulator runs without acceleration.
 - **Integrity Verification**: Downloads prebuilt release assets with SHA-256 checksum verification (`sha256sum --check`).
 - **Comprehensive Verification Suite**: Runs end-to-end execution checks on all installed compilers, SDKs, and CLI tools at the conclusion of the setup.
 
@@ -57,8 +59,9 @@ chmod +x setup.sh
 
 - **Operating System**: Debian, Ubuntu, or any compatible Debian-based distribution (including ChromeOS Crostini `penguin` and Android pKVM Linux Terminal).
 - **Architecture**: `amd64` (x86_64) or `arm64` (aarch64).
-- **Disk Space**: Minimum **6 GB** available on `/` (required for Android SDK components, JDK, and toolchains).
+- **Disk Space**: Minimum **8 GB** available on `/` (required for Android SDK components, the Android Emulator, JDK, and toolchains). Emulator system images and virtual devices are not installed by the script; budget roughly 4 GB per system image and 3–9 GB per virtual device on top.
 - **Privileges**: Root access or `sudo` capability.
+- **GPU Acceleration on ChromeOS** (optional, used by the Android Emulator): enable `chrome://flags/#crostini-gpu-support`, then fully restart Linux (right-click Terminal → *Shut down Linux*, or restart the Chromebook). On containerless Linux (Baguette), if `/dev/dri` is still missing, start the VM with the GPU from crosh (`Ctrl+Alt+T`): `vmc list`, `vmc stop <vm-name>`, then `vmc start --enable-gpu --vm-type BAGUETTE <vm-name>`. Check with `eglinfo -B -p surfaceless`; an `llvmpipe` renderer means software rendering.
 
 ---
 
@@ -70,7 +73,9 @@ The script automatically validates all installations before completing. You can 
 adb version && fastboot --version
 agy --version
 android --version
+~/Android/Sdk/emulator/emulator -version && ~/Android/Sdk/emulator/emulator -accel-check
 claude --version
+eglinfo -B -p surfaceless | grep 'OpenGL core profile renderer'   # llvmpipe = no GPU acceleration
 git --version
 go version
 java -version && javac -version
