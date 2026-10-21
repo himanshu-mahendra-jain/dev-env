@@ -45,9 +45,9 @@ chmod +x setup.sh
 - **Privilege Separation**: System-level packages and `/usr/local/bin` symlinks are configured with root privileges, while user configs, Android SDK, and agent environments are installed directly under the invoking user (`$TARGET_HOME`) with proper ownership (`chown`).
 - **Modern Environment Integration**:
   - Sets up systemd user environment generators in `~/.config/environment.d/` (`android.conf`, `java.conf`, `local-bin.conf`, `node.conf`).
-  - Loads environment configurations dynamically across login and interactive shells (`~/.profile`, `~/.bashrc`, and `~/.zshenv` for Zsh users) guarded by idempotent delimiters and reload guards.
-  - Prioritizes security and privilege separation: system-wide toolchains (`go`, `gofmt`, `java`, `javac`) are linked into `/usr/local/bin`, while user-space binaries (`android`, `adb`, `fastboot`, `agy`, `claude`) remain securely scoped to the user's home and PATH without exposing user-owned binaries to root.
-- **System Cleanup**: Removes `vim` if installed, then runs `apt-get autoremove -y` to clear its leftover dependencies (e.g. `vim-runtime`, `libsodium23`). Note that `autoremove` also removes any other packages APT considers no longer needed.
+  - Loads environment configurations dynamically across login and interactive shells (`~/.profile`, `~/.bashrc`, and `~/.zshenv` for Zsh users) through a block between idempotent delimiters. The block reloads in every shell, so PATH survives Debian's `/etc/profile` resetting it in login shells, and drops duplicate PATH entries.
+  - Prioritizes security and privilege separation: system-wide toolchains (`go`, `gofmt`, `java`, `javac`) are linked into `/usr/local/bin`, while user-space binaries (`android`, `adb`, `fastboot`, `emulator`, `agy`, `claude`) remain securely scoped to the user's home and PATH without exposing user-owned binaries to root.
+- **System Cleanup**: Removes `vim` if installed (the minimal `vi` from `vim-tiny` is kept), then runs `apt-get autoremove -y` on every run to clear leftover dependencies (e.g. `vim-runtime`, `libsodium23`), including ones left by earlier removals. Note that `autoremove` also removes any other packages APT considers no longer needed; keep one with `sudo apt-mark manual <package>`.
 - **GPU Device Access**: Adds the target user to the `render` and `video` groups (when they exist) so GPU-accelerated tools can open `/dev/dri` in sessions without a logind seat, such as ChromeOS Linux, SSH or CI. The current session gets access right away via ACLs; new groups take effect after logging out or fully shutting down the Linux VM.
 - **KVM for the Android Emulator**: When hardware virtualization and `/dev/kvm` are available (including nested KVM on ChromeOS Linux), adds the target user to the `kvm` group, grants the current session access via an ACL, and verifies that `/dev/kvm` opens read/write. KVM is used only for Android emulator acceleration, so when it is missing or cannot be opened (e.g. VMs or platforms without nested virtualization) setup continues with a warning and the emulator runs without acceleration.
 - **Integrity Verification**: Downloads prebuilt release assets with SHA-256 checksum verification (`sha256sum --check`).
@@ -73,7 +73,7 @@ The script automatically validates all installations before completing. You can 
 adb version && fastboot --version
 agy --version
 android --version
-~/Android/Sdk/emulator/emulator -version && ~/Android/Sdk/emulator/emulator -accel-check
+emulator -version && emulator -accel-check
 claude --version
 eglinfo -B -p surfaceless | grep 'OpenGL core profile renderer'   # llvmpipe = no GPU acceleration
 git --version

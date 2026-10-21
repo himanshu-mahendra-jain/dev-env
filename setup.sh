@@ -167,13 +167,7 @@ done
 echo "✓ Required packages installed"
 
 # Cleanup
-VIM_WAS_INSTALLED=0
-if dpkg-query -W -f='${Status}\n' vim 2>/dev/null | grep -q "install ok installed"; then
-    VIM_WAS_INSTALLED=1
-    apt-get remove -y vim
-    apt-get autoremove -y
-    apt-get clean
-fi
+apt-get remove -y vim
 
 # Verify vim is removed
 if dpkg-query -W -f='${Status}\n' vim 2>/dev/null | grep -q "install ok installed"; then
@@ -181,10 +175,13 @@ if dpkg-query -W -f='${Status}\n' vim 2>/dev/null | grep -q "install ok installe
     exit 1
 fi
 
-if (( VIM_WAS_INSTALLED )); then
-    echo "✓ vim removed"
-    echo "✓ APT cleanup complete"
-fi
+echo "✓ vim removed"
+
+# Remove packages no longer needed, including leftovers from earlier removals
+apt-get autoremove -y
+apt-get clean
+
+echo "✓ APT cleanup complete"
 
 # Grant GPU device access (/dev/dri) to sessions without a logind seat, such as ChromeOS Linux
 if [[ "$TARGET_USER" != "root" ]]; then
@@ -580,14 +577,14 @@ echo "✓ Android SDK platform $ANDROID_PLATFORM_VERSION installed"
 echo "✓ Android SDK build-tools $ANDROID_BUILD_TOOLS_VERSION installed"
 echo "✓ Android Emulator installed"
 
-# Configure Android SDK environment and platform-tools PATH
+# Configure Android SDK environment and platform-tools/emulator PATH
 run_as_target bash -c '
     mkdir -p "$HOME/.config/environment.d"
     rm -f "$HOME/.config/environment.d/android-cli.conf" "$HOME/.config/environment.d/android-platform-tools.conf"
 
     cat > "$HOME/.config/environment.d/android.conf" <<EOF
 ANDROID_HOME=\$HOME/Android/Sdk
-PATH=\$HOME/Android/Sdk/platform-tools:\$PATH
+PATH=\$HOME/Android/Sdk/emulator:\$HOME/Android/Sdk/platform-tools:\$PATH
 EOF
 '
 
@@ -1042,14 +1039,27 @@ run_as_target TARGET_SHELL="$TARGET_SHELL" bash -c '
         cat >> "$startup_file" <<'\''EOF'\''
 # >>> dev-env >>>
 # Load environment configurations from ~/.config/environment.d
-if [ -z "${DEV_ENV_LOADED:-}" ] && [ -d "$HOME/.config/environment.d" ]; then
+if [ -d "$HOME/.config/environment.d" ]; then
     set -a
     for env_file in "$HOME/.config/environment.d"/*.conf; do
         [ -r "$env_file" ] && . "$env_file"
     done
     set +a
     unset env_file
-    export DEV_ENV_LOADED=1
+
+    # Reloading prepends PATH entries again; keep only the first occurrence of each
+    dev_env_path=
+    dev_env_rest="$PATH:"
+    while [ -n "$dev_env_rest" ]; do
+        dev_env_dir="${dev_env_rest%%:*}"
+        dev_env_rest="${dev_env_rest#*:}"
+        case ":$dev_env_path:" in
+            *":$dev_env_dir:"*) ;;
+            *) [ -n "$dev_env_dir" ] && dev_env_path="${dev_env_path:+$dev_env_path:}$dev_env_dir" ;;
+        esac
+    done
+    PATH="$dev_env_path"
+    unset dev_env_path dev_env_rest dev_env_dir
 fi
 # <<< dev-env <<<
 EOF
